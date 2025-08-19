@@ -1,0 +1,391 @@
+import os, json, time, math
+from datetime import datetime, timezone, timedelta
+import pandas as pd, numpy as np
+import requests
+import yfinance as yf
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ------------------- paths / constants -------------------
+ROOT = os.getcwd()
+LOGDIR = os.path.join(ROOT, "logs")
+PREF_FILE = os.path.join(ROOT, "tools", "source_pref.json")
+TD_BASE = "https://api.twelvedata.com/time_series"
+TD_KEY = os.getenv("TWELVE_DATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY")
+NO_PROXY = os.getenv("NO_PROXY", "") + "," + os.getenv("no_proxy", "")
+PROFILE = "ship" if ("twelvedata.com" in NO_PROXY) else "land"
+PROFILE_NOTE = "TD OK, Yahoo blocked" if PROFILE == "ship" else "Yahoo preferred"
+
+# ------------------- dirs -------------------
+os.makedirs(LOGDIR, exist_ok=True)
+os.makedirs(os.path.dirname(PREF_FILE), exist_ok=True)
+
+def now_utc():
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+def log(line: str):
+    try:
+        with open(os.path.join(LOGDIR, "data_fetch.log"), "a", encoding="utf-8") as f:
+            f.write(f"{now_utc().isoformat()} | {line}\n")
+    except Exception:
+        pass
+
+# ------------------- adaptive preference -------------------
+def _load_prefs():
+    try:
+        with open(PREF_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_prefs(obj):
+    try:
+        with open(PREF_FILE, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+def get_preferred_source(symbol: str) -> str:
+    # env override
+    if os.getenv("PREFER_TD", "").strip() == "1":
+        return "twelvedata"
+    prefs = _load_prefs()
+    rec = prefs.get(symbol)
+    if rec and rec.get("until", 0) > time.time():
+        return rec.get("source", "yahoo")
+    return "yahoo" if PROFILE == "land" else "twelvedata"
+
+def set_preferred_source(symbol: str, source: str, hours: int = 6):
+    prefs = _load_prefs()
+    prefs[symbol] = {"source": source, "until": time.time() + hours * 3600}
+    _save_prefs(prefs)
+    log(f"prefer:{symbol} -> {source} for {hours}h")
+
+# ------------------- symbol normalization -------------------
+# Returns (yahoo_symbol, twelvedata_symbol, pretty_symbol)
+def normalize_symbol(sym: str):
+    s = sym.strip().upper().replace("=X", "").replace("-", "")
+    s = s.replace("/", "")
+    # keep raw “EURUSD” etc.
+    y = f"{s}=X"  # Yahoo
+    td = f"{s}"   # TwelveData wants plain (EURUSD, XAUUSD)
+    # Pretty with slash for display
+    pretty = f"{s[0:3]}/{s[3:6]}" if len(s) == 6 else s
+    return y, td, pretty
+
+# ------------------- unified error -------------------
+def handle_error(source: str, symbol: str, err: Exception):
+    msg = f"{source}({symbol}) error: {type(err).__name__}: {err}"
+    log(msg)
+
+# ------------------- fetchers -------------------
+def fetch_from_yahoo(y_sym: str, interval: str):
+    try:
+        df = yf.download(tickers=y_sym, period="60d", interval=interval, progress=False)
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns=str.title).dropna()
+        # Standardize for our pipeline
+        df = df[["Open","High","Low","Close","Volume"]].astype(float)
+        return df
+    except Exception as e:
+        handle_error("yahoo", y_sym, e)
+        return None
+
+def fetch_from_twelvedata(td_sym: str, interval: str):
+    if not TD_KEY:
+        return None
+    try:
+        params = {"symbol": td_sym, "interval": interval, "outputsize": 200, "apikey": TD_KEY}
+        # honor NO_PROXY bypass
+        proxies = {"https": None} if "twelvedata.com" in NO_PROXY else None
+        r = requests.get(TD_BASE, params=params, timeout=15, proxies=proxies)
+        r.raise_for_status()
+        j = r.json()
+        if "values" not in j:
+            raise ValueError(f"TD response missing 'values': {j}")
+        vals = j["values"]
+        if not vals:
+            return None
+        df = pd.DataFrame(vals)
+        df.rename(columns={"datetime":"datetime","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        df = df.set_index("datetime").sort_index()
+        # TD sends strings; cast
+        for c in ["Open","High","Low","Close","Volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna()
+        return df
+    except Exception as e:
+        handle_error("twelvedata", td_sym, e)
+        return None
+
+# ------------------- indicators (unchanged) -------------------
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+
+RSI_LEN=14; MACD_FAST, MACD_SLOW, MACD_SIG = 12,26,9
+ADX_LEN=14; ATR_LEN=14; VOL_MA=20
+EMA_FAST_1, EMA_SLOW_1 = 9,21
+EMA_FAST_2, EMA_SLOW_2 = 20,50
+EMA_LONG=200
+MFI_LEN=14; OBV_MA=20
+MID_CANDLE_GUARD_FRAC=0.15
+
+WEIGHTS_16 = {
+    "ema_cross_9_21":1,"ema_cross_20_50":1,"rsi_zone":1,"rsi_div":1,"macd_hist_flip":1,"macd_cross":1,
+    "adx_trend":1,"atr_zone":1,"candle_pattern":1,"mtf_confluence":1,"fibo_touch":1,"sr_break":1,
+    "high_volume":1,"momentum_body":1,"no_opposing_htf":1,"price_above_200":1
+}
+WEIGHTS_6 = {"no_red_news_1h":1,"news_sentiment_ok":1,"no_cb_conflict":1,"spread_ok":1,"tg_agreement":1,"not_mid_candle":1}
+SPREAD_PIPS = {"EURUSD=X":1.2,"GBPUSD=X":1.5,"USDJPY=X":1.3,"XAUUSD=X":25.0,"XAGUSD=X":30.0}
+
+def rsi(series, n=RSI_LEN):
+    delta = series.diff()
+    up = np.where(delta>0, delta, 0.0)
+    down = np.where(delta<0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/n, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100.0 - (100.0/(1.0+rs))
+
+def macd(close):
+    ema_fast = ema(close, MACD_FAST); ema_slow = ema(close, MACD_SLOW)
+    macd_line = ema_fast - ema_slow
+    signal = ema(macd_line, MACD_SIG)
+    hist = macd_line - signal
+    return macd_line, signal, hist
+
+def true_range(df):
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([(df["High"]-df["Low"]).abs(), (df["High"]-prev_close).abs(), (df["Low"]-prev_close).abs()], axis=1).max(axis=1)
+    return tr
+
+def atr(df, n=ATR_LEN): return true_range(df).rolling(n).mean()
+
+def adx(df, n=ADX_LEN):
+    up_move = df["High"].diff(); down_move = -df["Low"].diff()
+    plus_dm = np.where((up_move>down_move) & (up_move>0), up_move, 0.0)
+    minus_dm = np.where((down_move>up_move) & (down_move>0), down_move, 0.0)
+    tr = true_range(df); atr_w = tr.rolling(n).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(n).mean() / (atr_w + 1e-12)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(n).mean() / (atr_w + 1e-12)
+    dx = ((plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12)) * 100
+    return dx.rolling(n).mean()
+
+def mfi(df, n=MFI_LEN):
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    mf = tp * df["Volume"]
+    pos = np.where(tp > tp.shift(1), mf, 0.0)
+    neg = np.where(tp < tp.shift(1), mf, 0.0)
+    pos_sum = pd.Series(pos, index=df.index).rolling(n).sum()
+    neg_sum = pd.Series(neg, index=df.index).rolling(n).sum()
+    mr = pos_sum / (neg_sum + 1e-12)
+    return 100 - (100/(1+mr))
+
+def obv(df):
+    obv = [0]
+    for i in range(1, len(df)):
+        if df["Close"].iloc[i] > df["Close"].iloc[i-1]: obv.append(obv[-1] + df["Volume"].iloc[i])
+        elif df["Close"].iloc[i] < df["Close"].iloc[i-1]: obv.append(obv[-1] - df["Volume"].iloc[i])
+        else: obv.append(obv[-1])
+    s = pd.Series(obv, index=df.index)
+    return s, s.rolling(OBV_MA).mean()
+
+def is_bullish_engulfing(df):
+    if len(df)<2: return False
+    prev = df.iloc[-2]; cur = df.iloc[-1]
+    return (prev.Close < prev.Open) and (cur.Close > cur.Open) and (cur.Close > prev.Open) and (cur.Open < prev.Close)
+
+def is_bearish_engulfing(df):
+    if len(df)<2: return False
+    prev = df.iloc[-2]; cur = df.iloc[-1]
+    return (prev.Close > prev.Open) and (cur.Close < cur.Open) and (cur.Close < prev.Open) and (cur.Open > prev.Close)
+
+def is_hammer(df):
+    cur = df.iloc[-1]; body = abs(cur.Close - cur.Open); rng = cur.High - cur.Low + 1e-12
+    lower_wick = min(cur.Open, cur.Close) - cur.Low; upper_wick = cur.High - max(cur.Open, cur.Close)
+    return (lower_wick >= 2*body) and (upper_wick <= body) and (body/rng <= 0.67)
+
+def momentum_body_gt_50(df):
+    cur = df.iloc[-1]; body = abs(cur.Close - cur.Open); rng = (cur.High - cur.Low) + 1e-12
+    return (body / rng) >= 0.5
+
+def recent_swing_levels(df, bars=120):
+    seg = df.iloc[-bars:]
+    return seg.High.max(), seg.Low.min()
+
+def fibo_flags(price, hi, lo, tol=0.003):
+    if hi==lo: return False
+    diff = hi - lo; f382 = lo + 0.382*diff; f500 = lo + 0.500*diff; f618 = lo + 0.618*diff
+    for f in (f382, f500, f618):
+        if abs(price - f) / max(1e-6, diff) <= tol: return True
+    return False
+
+def within_mid_candle(now_ts, last_ts, tf_minutes, guard_frac=MID_CANDLE_GUARD_FRAC):
+    elapsed = (now_ts - last_ts).total_seconds(); period = tf_minutes*60.0
+    frac = elapsed/period if period>0 else 1.0
+    return (frac >= guard_frac) and (frac <= (1.0-guard_frac))
+
+def score_16(df, tf_minutes, df_higher=None):
+    out = {k:0 for k in WEIGHTS_16}
+    if df.empty or len(df)<EMA_LONG+5: return 0, out, {}
+    close = df["Close"]; vol = df["Volume"]
+    ema9, ema21 = ema(close, EMA_FAST_1), ema(close, EMA_SLOW_1)
+    ema20, ema50 = ema(close, EMA_FAST_2), ema(close, EMA_SLOW_2)
+    ema200 = ema(close, EMA_LONG)
+    r = rsi(close); macd_line, macd_sig, macd_hist = macd(close)
+    adx_v = adx(df); atr_v = atr(df); mfi_v = mfi(df); obv_v, obv_ma = obv(df)
+
+    out["ema_cross_9_21"] = int((ema9.iloc[-2] < ema21.iloc[-2] and ema9.iloc[-1] > ema21.iloc[-1]) or (ema9.iloc[-2] > ema21.iloc[-2] and ema9.iloc[-1] < ema21.iloc[-1]))
+    out["ema_cross_20_50"] = int((ema20.iloc[-2] < ema50.iloc[-2] and ema20.iloc[-1] > ema50.iloc[-1]) or (ema20.iloc[-2] > ema50.iloc[-2] and ema20.iloc[-1] < ema50.iloc[-1]))
+    out["rsi_zone"] = int(r.iloc[-1] >= 60 or r.iloc[-1] <= 40)
+
+    def simple_divergence(series, osc, look=20):
+        s = series.iloc[-look:]; o = osc.iloc[-look:]
+        ph = s.idxmax(); oh = o.idxmax(); pl = s.idxmin(); ol = o.idxmin()
+        bear = s.iloc[-1] >= s.loc[ph] and o.iloc[-1] < o.loc[oh]
+        bull = s.iloc[-1] <= s.loc[pl] and o.iloc[-1] > o.loc[ol]
+        return bear or bull
+    out["rsi_div"] = int(simple_divergence(close, r))
+
+    out["macd_hist_flip"] = int((macd_hist.iloc[-1] > 0 and macd_hist.iloc[-2] <= 0) or (macd_hist.iloc[-1] < 0 and macd_hist.iloc[-2] >= 0))
+    out["macd_cross"] = int((macd_line.iloc[-2] < macd_sig.iloc[-2] and macd_line.iloc[-1] > macd_sig.iloc[-1]) or (macd_line.iloc[-2] > macd_sig.iloc[-2] and macd_line.iloc[-1] < macd_sig.iloc[-1]))
+    out["adx_trend"] = int(adx_v.iloc[-1] >= 20)
+    out["atr_zone"] = int(atr_v.iloc[-1] >= atr_v.rolling(100).median().iloc[-1])
+
+    if is_bullish_engulfing(df) or is_bearish_engulfing(df) or is_hammer(df): out["candle_pattern"]=1
+
+    out["mtf_confluence"] = 0
+    if df_higher is not None and len(df_higher)>0:
+        e21_l = ema(df["Close"], EMA_SLOW_1).diff().iloc[-1]
+        e21_h = ema(df_higher["Close"], EMA_SLOW_1).diff().iloc[-1]
+        out["mtf_confluence"] = int((e21_l>0 and e21_h>0) or (e21_l<0 and e21_h<0))
+
+    hi, lo = recent_swing_levels(df, 120)
+    out["fibo_touch"] = int(fibo_flags(close.iloc[-1], hi, lo))
+    out["sr_break"] = int(close.iloc[-1] > hi or close.iloc[-1] < lo)
+    out["high_volume"] = int(vol.iloc[-1] >= vol.rolling(VOL_MA).mean().iloc[-1])
+    out["momentum_body"] = int(momentum_body_gt_50(df))
+
+    out["no_opposing_htf"] = 1
+    if df_higher is not None and len(df_higher)>1:
+        opp = (is_bullish_engulfing(df) and is_bearish_engulfing(df_higher)) or (is_bearish_engulfing(df) and is_bullish_engulfing(df_higher))
+        out["no_opposing_htf"] = int(not opp)
+
+    out["price_above_200"] = int(close.iloc[-1] >= ema200.iloc[-1])
+
+    extras = {"mfi": float(mfi_v.iloc[-1]), "obv_trend": int((obv_v.iloc[-1]-obv_v.iloc[-2])>0), "obv_above_ma": int(obv_v.iloc[-1]>=obv_ma.iloc[-1])}
+    score = sum(WEIGHTS_16[k]*out[k] for k in WEIGHTS_16)
+    return score, out, extras
+
+def last_bar_timestamp(df):
+    ts = df.index[-1]
+    if hasattr(ts, "to_pydatetime"):
+        ts = ts.to_pydatetime()
+    return ts.replace(tzinfo=timezone.utc).astimezone(timezone.utc)
+
+def score_6(symbol: str, tf_minutes:int, last_bar_time:datetime, now:datetime, spread_override:float=None):
+    out = {k:0 for k in WEIGHTS_6}
+    out["no_red_news_1h"] = 0; out["news_sentiment_ok"] = 0; out["no_cb_conflict"] = 0
+    spread = spread_override if spread_override is not None else SPREAD_PIPS.get(symbol, 2.0)
+    out["spread_ok"] = int(spread <= 1.5 if "USD=X" in symbol else spread <= 2.0)
+    out["tg_agreement"] = 0
+    out["not_mid_candle"] = int(within_mid_candle(now, last_bar_time, tf_minutes))
+    score = sum(WEIGHTS_6[k]*out[k] for k in WEIGHTS_6)
+    return score, out, {"spread": spread}
+
+def build_context(df):
+    close = df["Close"]; ema21 = ema(close, EMA_SLOW_1); macd_line, sig, hist = macd(close)
+    bull = (close.iloc[-1] > ema21.iloc[-1]) and (hist.iloc[-1] >= 0)
+    bear = (close.iloc[-1] < ema21.iloc[-1]) and (hist.iloc[-1] <= 0)
+    return {"bias": "bull" if bull else ("bear" if bear else "flat")}
+
+def decide_action(tech_score:int, fund_score:int, ctx:dict):
+    if tech_score >= 9 and fund_score >= 3:
+        return "BUY" if ctx.get("bias")=="bull" else ("SELL" if ctx.get("bias")=="bear" else "WAIT")
+    return "WAIT"
+
+def format_signal(symbol, tf_label, when_utc, action, score16, score6, reasons, last_bar, spread, source, profile_note):
+    lines = []
+    lines.append(f"📊 {symbol} ({tf_label})")
+    lines.append(f"🕒 Signal Time: {when_utc.isoformat(timespec='minutes')}")
+    lines.append(f"📜 Source: {source} ({PROFILE}-net: {profile_note})")
+    lines.append(f"📈 Action: ✅ {action}")
+    lines.append(f"📊 Score: {score16}/16 + {score6}/6")
+    lines.append(f"🧠 Reason: {reasons if reasons else 'mixed'}")
+    lines.append(f"🧩 Last Bar: {last_bar.isoformat(timespec='minutes')}")
+    lines.append(f"📉 Spread: {spread:.2f} pips")
+    return "\n".join(lines)
+
+# ------------------- main analysis -------------------
+def run_analysis(symbol: str, tf_minutes:int, htf_minutes:int=240, spread_override:float=None):
+    # interval map for both sources
+    interval_map = {1:"1m",5:"5m",15:"15m",30:"30m",60:"60m",240:"240m"}
+    td_interval = {1:"1min",5:"5min",15:"15min",30:"30min",60:"1h",240:"4h"}
+    interval_y = interval_map.get(tf_minutes, "60m")
+    interval_td = td_interval.get(tf_minutes, "1h")
+
+    y_sym, td_sym, pretty = normalize_symbol(symbol)
+    preferred = get_preferred_source(pretty)
+    order = ["twelvedata","yahoo"] if preferred=="twelvedata" else ["yahoo","twelvedata"]
+
+    df = None; source_used = None
+    for src in order:
+        if src == "yahoo":
+            df = fetch_from_yahoo(y_sym, interval_y)
+        else:
+            df = fetch_from_twelvedata(td_sym, interval_td)
+        if df is not None and len(df)>=210:
+            source_used = src
+            break
+
+    # if first failed but second ok → prefer second for a while
+    if source_used and source_used != order[0]:
+        set_preferred_source(pretty, source_used, hours=6)
+
+    if df is None or df.empty:
+        return f"📊 {y_sym}\nNo data. Wait."
+
+    # fetch higher TF for confluence (best‑effort)
+    df_h = None
+    try:
+        if htf_minutes:
+            if source_used == "yahoo":
+                df_h = fetch_from_yahoo(y_sym, interval_map.get(htf_minutes,"240m"))
+            else:
+                df_h = fetch_from_twelvedata(td_sym, td_interval.get(htf_minutes,"4h"))
+    except Exception:
+        df_h = None
+
+    ctx = build_context(df)
+    s16, map16, extras = score_16(df, tf_minutes, df_h)
+    last_ts = last_bar_timestamp(df)
+    now = now_utc()
+    s6, map6, more = score_6(y_sym, tf_minutes, last_ts, now, spread_override)
+    action = decide_action(s16, s6, ctx)
+
+    reasons = []
+    if map16["candle_pattern"]: reasons.append("pattern")
+    if map16["ema_cross_9_21"] or map16["ema_cross_20_50"]: reasons.append("EMA cross")
+    if map16["rsi_zone"]: reasons.append("RSI zone")
+    if map16["macd_hist_flip"] or map16["macd_cross"]: reasons.append("MACD")
+    if map16["mtf_confluence"]: reasons.append("MTF OK")
+    if map16["fibo_touch"]: reasons.append("Fib area")
+    if map16["high_volume"]: reasons.append("vol↑")
+    if extras.get("obv_above_ma"): reasons.append("OBV↑")
+    if extras.get("mfi",50)>=60: reasons.append("MFI strong")
+
+    msg = format_signal(
+        symbol=pretty if "/" in pretty else pretty.replace("=X",""),
+        tf_label=f"H{int(tf_minutes/60)}" if tf_minutes>=60 else f"M{tf_minutes}",
+        when_utc=now,
+        action=action,
+        score16=s16, score6=s6,
+        reasons=" + ".join(reasons),
+        last_bar=last_ts,
+        spread=more["spread"],
+        source="TwelveData" if source_used=="twelvedata" else "Yahoo",
+        profile_note=PROFILE_NOTE
+    )
+    return msg

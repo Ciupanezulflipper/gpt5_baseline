@@ -1,0 +1,152 @@
+import os, argparse, asyncio, csv, json
+from pathlib import Path
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+from core import get_candles, score_16, score_6, build_bias, last_bar_time, detect_profile, now_utc, utc_iso
+from bot import send_telegram
+
+load_dotenv()
+
+LOGDIR = Path("logs"); LOGDIR.mkdir(exist_ok=True)
+JOURNAL = LOGDIR / "signals.csv"
+STATE   = LOGDIR / "last_signal.json"
+
+def _read_state():
+    if not STATE.exists(): return {}
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+def _write_state(d):
+    try:
+        STATE.write_text(json.dumps(d, indent=2))
+    except Exception:
+        pass
+
+def _cooldown_ok(key: str, action: str, score: int, minutes: int = 45) -> bool:
+    """
+    prevent spam: allow if action changed OR score improves by >=2 OR last alert older than cooldown
+    """
+    st = _read_state()
+    entry = st.get(key, {})
+    last_action = entry.get("action","")
+    last_score  = entry.get("score",0)
+    last_time_s = entry.get("time","")
+    if last_action != action:
+        return True
+    if score >= last_score + 2:
+        return True
+    if last_time_s:
+        try:
+            last_time = datetime.fromisoformat(last_time_s)
+            age_min = (now_utc() - last_time).total_seconds()/60.0
+            return age_min >= minutes
+        except Exception:
+            return True
+    return True
+
+def _update_state(key: str, action: str, score: int):
+    st = _read_state()
+    st[key] = {"action": action, "score": score, "time": now_utc().isoformat(timespec="minutes")}
+    _write_state(st)
+
+def _append_journal(row: dict):
+    new = not JOURNAL.exists()
+    with JOURNAL.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if new: w.writeheader()
+        w.writerow(row)
+
+def compose_message(symbol, tf, provider, profile_line, s16, s6, action, reasons, spread, last_ts):
+    lines = []
+    tf_label = f"H{int(tf/60)}" if tf>=60 else f"M{tf}"
+    lines.append(f"📊 {symbol} ({tf_label})")
+    lines.append(f"🕒 Signal Time: {now_utc().isoformat(timespec='minutes')}")
+    lines.append(f"🏷️ Source: {provider} ({profile_line})")
+    lines.append(f"📈 Action: ✅ {action}")
+    lines.append(f"📊 Score: {s16}/16 + {s6}/6")
+    lines.append(f"🧠 Reason: {reasons if reasons else 'mixed'}")
+    lines.append(f"🧩 Last Bar: {last_ts.isoformat(timespec='minutes')}")
+    lines.append(f"📉 Spread: {spread:.2f} pips")
+    return "\n".join(lines)
+
+def parse_args():
+    p = argparse.ArgumentParser(description="TomaMobileForexBot one-shot analyzer (resilient)")
+    p.add_argument("--symbol", default=os.getenv("DEFAULT_SYMBOL","EURUSD=X"), help="e.g., EURUSD or EURUSD=X or EUR/USD")
+    p.add_argument("--tf", type=int, default=int(os.getenv("DEFAULT_TIMEFRAME","60")), help="timeframe minutes: 60=H1, 240=H4")
+    p.add_argument("--htf", type=int, default=240, help="higher timeframe minutes (for confluence)")
+    p.add_argument("--spread", type=float, default=None, help="override spread pips")
+    p.add_argument("--profile", default="auto", choices=["auto","ship","land"], help="force net profile if needed")
+    p.add_argument("--no-telegram", action="store_true", help="print only")
+    return p.parse_args()
+
+async def main_async():
+    args = parse_args()
+
+    df, src, y_sym, td_sym, pretty, interval = get_candles(args.symbol, args.tf)
+    if df is None or df.empty:
+        msg = f"📊 {args.symbol}\nNo data. Wait."
+        print("\n"+msg+"\n")
+        if not args.no_telegram:
+            await send_telegram(msg)
+        return
+
+    # profile line (informational only)
+    profile_line = detect_profile(src) if args.profile=="auto" else f"forced: {args.profile}"
+
+    # build bias + scores
+    bias = build_bias(df)
+    s16, m16 = score_16(df, None)  # keep HTF simple for now; wire later if desired
+    last_ts = last_bar_time(df)
+    now = now_utc()
+    # rough spread defaults (majors 1.2, metals bigger) if not provided
+    spread = args.spread if args.spread is not None else (1.2 if "USD=X" in y_sym else 2.0)
+    s6, m6 = score_6(spread, args.tf, last_ts, now)
+
+    # decision
+    action = "WAIT"
+    if s16 >= 9 and s6 >= 3:
+        action = "BUY" if bias=="bull" else ("SELL" if bias=="bear" else "WAIT")
+
+    reasons = []
+    if m16.get("candle_pattern"): reasons.append("pattern")
+    if m16.get("ema_cross_9_21") or m16.get("ema_cross_20_50"): reasons.append("EMA cross")
+    if m16.get("rsi_zone"): reasons.append("RSI zone")
+    if m16.get("macd_hist_flip") or m16.get("macd_cross"): reasons.append("MACD")
+    if m16.get("mtf_confluence"): reasons.append("MTF OK")
+    if m16.get("fibo_touch"): reasons.append("Fib area")
+    if m16.get("high_volume"): reasons.append("vol↑")
+
+    # cool-down gate
+    key = f"{pretty}-{args.tf}"
+    if action != "WAIT":
+        if not _cooldown_ok(key, action, s16):
+            action = "WAIT"
+
+    msg = compose_message(pretty, args.tf, src, profile_line, s16, s6, action, " + ".join(reasons), spread, last_ts)
+    print("\n"+msg+"\n")
+    if not args.no_telegram:
+        await send_telegram(msg)
+
+    # journal row
+    _append_journal({
+        "time": now_utc().isoformat(timespec="minutes"),
+        "symbol": pretty,
+        "tf": args.tf,
+        "provider": src,
+        "profile": profile_line,
+        "action": action,
+        "score16": s16,
+        "score6": s6,
+        "spread": spread,
+        "last_bar": last_ts.isoformat(timespec="minutes")
+    })
+
+    # update state for cooldown
+    if action != "WAIT":
+        _update_state(key, action, s16)
+
+if __name__ == "__main__":
+    asyncio.run(main_async())

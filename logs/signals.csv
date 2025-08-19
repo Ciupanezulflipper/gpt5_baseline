@@ -1,0 +1,5 @@
+time,symbol,tf,provider,profile,action,score16,score6,spread,last_bar
+2025-08-15T09:54+00:00,EUR/USD,60,TwelveData,"ship-net: TD OK, Yahoo blocked",WAIT,4,1,1.2,2025-08-15T21:00+00:00
+2025-08-15T09:54+00:00,XAU/USD,60,TwelveData,"ship-net: TD OK, Yahoo blocked",WAIT,4,1,1.2,2025-08-15T21:00+00:00
+2025-08-15T09:55+00:00,EUR/USD,240,TwelveData,"ship-net: TD OK, Yahoo blocked",WAIT,3,1,1.2,2025-08-15T19:00+00:00
+2025-08-15T09:56+00:00,EUR/USD,60,TwelveData,"ship-net: TD OK, Yahoo blocked",WAIT,4,1,1.2,2025-08-15T21:00+00:00

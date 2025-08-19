@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local config / secrets
+.env
+*.env
+
+# Logs
+errors.log
+*.log
+
+# OS/Editor cruft
+.DS_Store
+*.swp
