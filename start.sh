@@ -19,3 +19,6 @@ python main.py --symbol "$1" --tf "$2" | tee -a "${LOG_FILE:-errors.log}"
 status=${PIPESTATUS[0]}
 echo "[`date -u +%FT%TZ`] END status=$status" | tee -a "${LOG_FILE:-errors.log}"
 exit $status
+
+# Finage key status + Telegram notify (warn/expired only)
+python helpers/finage_expiry_notify.py | tee -a "${LOG_FILE:-errors.log}"
